@@ -13,3 +13,10 @@ readme = "README.md"
 [dependencies]
 slog = "2"
 regex = "1"
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "kvfilter_benchmark"
+harness = false
