@@ -102,8 +102,14 @@ fn simple_or_benchmark(c: &mut Criterion) {
         let level_at_least = FilterSpec::LevelAtLeast;
 
         let filter_spec = FilterSpec::any_of(&[
-            match_kv("debug_key", "debug_value").and(level_at_least(Level::Debug)),
-            match_kv("trace_key", "trace_value").and(level_at_least(Level::Trace)),
+            FilterSpec::all_of(&[
+                match_kv("debug_key", "debug_value"),
+                level_at_least(Level::Debug),
+            ]),
+            FilterSpec::all_of(&[
+                match_kv("trace_key", "trace_value"),
+                level_at_least(Level::Trace),
+            ])
         ]);
 
         new_tester(filter_spec, EvaluationOrder::LoggerAndMessage)
@@ -222,7 +228,7 @@ fn przygienda_tester() -> Tester {
         ),
     ]);
 
-    let filter_spec = positive_filter.and(negative_filter.not());
+    let filter_spec = FilterSpec::all_of(&[positive_filter, negative_filter.not()]);
     new_tester(filter_spec, EvaluationOrder::LoggerAndMessage)
 }
 

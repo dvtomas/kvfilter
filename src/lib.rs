@@ -148,15 +148,17 @@ pub enum FilterSpec {
     /// Accept when the log message matches the given regular expression.
     MatchMsgRegex(RegexWrapper),
     /// Accept when all the sub-filters accept. Sub-filter are evaluated left-to-right.
+    /// Accepts on empty list
     ///
     /// Please note that slog processes KV arguments to `log!` right to left, that is e. g.
     /// `info!(log, "Msg"; "key1" => %value1, "key2" => %value2)` will first expand value2 and then value1.
-    And(Box<FilterSpec>, Box<FilterSpec>),
+    AllOf(Vec<FilterSpec>),
     /// Accept when at least one of the sub-filters accepts. Sub-filter are evaluated left-to-right.
+    /// Rejects on empty list
     ///
     /// Please note that slog processes KV arguments to `log!` right to left, that is e. g.
     /// `info!(log, "Msg"; "key1" => %value1, "key2" => %value2)` will first expand value2 and then value1.
-    Or(Box<FilterSpec>, Box<FilterSpec>),
+    AnyOf(Vec<FilterSpec>),
     /// Turns an Accept into a Reject and vice versa.
     Not(Box<FilterSpec>),
 }
@@ -184,44 +186,14 @@ impl FilterSpec {
         Ok(Self::match_msg_regex(Regex::new(regex)?))
     }
 
-    pub fn and(self, other: FilterSpec) -> FilterSpec {
-        FilterSpec::And(Box::new(self), Box::new(other))
+    /// Creates a filter that accepts if all of the variants accept. Accepts on empty `variants` collection.
+    pub fn all_of(variants: &[FilterSpec]) -> FilterSpec {
+        FilterSpec::AllOf(variants.into_iter().map(|fs| fs.clone()).collect())
     }
 
     /// Creates a filter that accepts if any of the variant accepts. Rejects on empty `variants` collection.
-    ///
-    /// variants are composed using foldr, that is [a, b, c] -> Or(a, Or(b, c))
     pub fn any_of(variants: &[FilterSpec]) -> FilterSpec {
-        match variants.split_first() {
-            Some((head, tail)) => {
-                if tail.is_empty() {
-                    head.clone()
-                } else {
-                    head.clone().or(Self::any_of(tail))
-                }
-            }
-            None => FilterSpec::Reject,
-        }
-    }
-
-    /// Creates a filter that accepts if all of the variants accept. Rejects on empty `variants` collection.
-    ///
-    /// variants are composed using foldr, that is [a, b, c] -> And(a, And(b, c))
-    pub fn all_of(variants: &[FilterSpec]) -> FilterSpec {
-        match variants.split_first() {
-            Some((head, tail)) => {
-                if tail.is_empty() {
-                    head.clone()
-                } else {
-                    head.clone().and(Self::all_of(tail))
-                }
-            }
-            None => FilterSpec::Reject,
-        }
-    }
-
-    pub fn or(self, other: FilterSpec) -> FilterSpec {
-        FilterSpec::Or(Box::new(self), Box::new(other))
+        FilterSpec::AnyOf(variants.into_iter().map(|fs| fs.clone()).collect())
     }
 
     pub fn not(self) -> FilterSpec {
@@ -387,23 +359,21 @@ impl<D> KVFilter<D> {
                     }
                 }
                 Filter::MatchMsgRegex(_) => AcceptOrReject::Reject,
-                Filter::And(a, b) => {
-                    if final_evaluate_filter(a, level) == AcceptOrReject::Accept
-                        && final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
-                        AcceptOrReject::Reject
+                Filter::AllOf(sub_specs) => {
+                    for sub_spec in sub_specs {
+                        if final_evaluate_filter(sub_spec, level) == AcceptOrReject::Reject {
+                            return AcceptOrReject::Reject;
+                        }
                     }
+                    AcceptOrReject::Accept
                 }
-                Filter::Or(a, b) => {
-                    if final_evaluate_filter(a, level) == AcceptOrReject::Accept
-                        || final_evaluate_filter(b, level) == AcceptOrReject::Accept
-                        {
-                            AcceptOrReject::Accept
-                        } else {
-                        AcceptOrReject::Reject
+                Filter::AnyOf(sub_specs) => {
+                    for sub_spec in sub_specs {
+                        if final_evaluate_filter(sub_spec, level) == AcceptOrReject::Accept {
+                            return AcceptOrReject::Accept;
+                        }
                     }
+                    AcceptOrReject::Reject
                 }
                 Filter::Not(f) => {
                     if final_evaluate_filter(f, level) == AcceptOrReject::Accept {
@@ -472,8 +442,8 @@ enum Filter<'a> {
         values: HashSet<&'a str>,
     },
     MatchMsgRegex(&'a RegexWrapper),
-    And(Box<Filter<'a>>, Box<Filter<'a>>),
-    Or(Box<Filter<'a>>, Box<Filter<'a>>),
+    AllOf(Vec<Filter<'a>>),
+    AnyOf(Vec<Filter<'a>>),
     Not(Box<Filter<'a>>),
 }
 
@@ -492,13 +462,11 @@ impl<'a> Filter<'a> {
                 values: values.iter().map(|v| v.as_str()).collect(),
             },
             FilterSpec::MatchMsgRegex(regex_wrapper) => Filter::MatchMsgRegex(&regex_wrapper),
-            FilterSpec::And(a, b) => Filter::And(
-                Box::new(Filter::from_spec(&a)),
-                Box::new(Filter::from_spec(&b)),
+            FilterSpec::AllOf(sub_specs) => Filter::AllOf(
+                sub_specs.iter().map(Filter::from_spec).collect()
             ),
-            FilterSpec::Or(a, b) => Filter::Or(
-                Box::new(Filter::from_spec(&a)),
-                Box::new(Filter::from_spec(&b)),
+            FilterSpec::AnyOf(sub_specs) => Filter::AnyOf(
+                sub_specs.iter().map(Filter::from_spec).collect()
             ),
             FilterSpec::Not(f) => Filter::Not(Box::new(Filter::from_spec(&f))),
         }
@@ -614,38 +582,73 @@ impl<'a> Serializer for EvaluateFilterSerializer<'a> {
                         None
                     }
                 }
-                Filter::And(a, b) => {
-                    evaluate_filter_with_kv(a, context)?;
-                    if **a == Filter::Reject {
-                        Some(Filter::Reject)
-                    } else {
-                        evaluate_filter_with_kv(b, context)?;
-                        if **a == Filter::Accept {
-                            if **b == Filter::Accept {
-                                Some(Filter::Accept)
-                            } else if **b == Filter::Reject {
-                                Some(Filter::Reject)
+                Filter::AllOf(sub_specs) => {
+                    let mut fast_reject = false;
+                    let mut i = 0;
+                    let mut n = sub_specs.len();
+                    while i < n {
+                        let remove_current_sub_spec = {
+                            let sub_spec = &mut sub_specs[i];
+                            evaluate_filter_with_kv(sub_spec, context)?;
+                            if *sub_spec == Filter::Reject {
+                                fast_reject = true;
+                                break;
+                            } else if *sub_spec == Filter::Accept {
+                                true
                             } else {
-                                None
+                                false
                             }
+                        };
+
+                        if remove_current_sub_spec {
+                            sub_specs.swap_remove(i);
+                            n -= 1;
                         } else {
-                            None
+                            i += 1;
                         }
                     }
-                }
-                Filter::Or(a, b) => {
-                    evaluate_filter_with_kv(a, context)?;
-                    if **a == Filter::Accept {
+
+                    if fast_reject {
+                        Some(Filter::Reject)
+                    } else if sub_specs.is_empty() {
                         Some(Filter::Accept)
                     } else {
-                        evaluate_filter_with_kv(b, context)?;
-                        if **b == Filter::Accept {
-                            Some(Filter::Accept)
-                        } else if **a == Filter::Reject && **b == Filter::Reject {
-                            Some(Filter::Reject)
+                        None
+                    }
+                }
+
+                Filter::AnyOf(sub_specs) => {
+                    let mut fast_accept = false;
+                    let mut i = 0;
+                    let mut n = sub_specs.len();
+                    while i < n {
+                        let remove_current_sub_spec = {
+                            let sub_spec = &mut sub_specs[i];
+                            evaluate_filter_with_kv(sub_spec, context)?;
+                            if *sub_spec == Filter::Accept {
+                                fast_accept = true;
+                                break;
+                            } else if *sub_spec == Filter::Reject {
+                                true
+                            } else {
+                                false
+                            }
+                        };
+
+                        if remove_current_sub_spec {
+                            sub_specs.swap_remove(i);
+                            n -= 1;
                         } else {
-                            None
+                            i += 1;
                         }
+                    }
+
+                    if fast_accept {
+                        Some(Filter::Accept)
+                    } else if sub_specs.is_empty() {
+                        Some(Filter::Reject)
+                    } else {
+                        None
                     }
                 }
                 Filter::Not(f) => {
@@ -792,25 +795,13 @@ mod tests {
     }
 
     #[test]
-    fn test_any_all_of() {
-        let a = FilterSpec::match_kv("k1", "v1");
-        let b = FilterSpec::match_kv("k2", "v2");
-        let c = FilterSpec::match_kv("k3", "v3");
-        assert_eq!(
-            a.clone().or(b.clone().or(c.clone())),
-            FilterSpec::any_of(&[a.clone(), b.clone(), c.clone()])
-        );
-        assert_eq!(
-            a.clone().and(b.clone().and(c.clone())),
-            FilterSpec::all_of(&[a.clone(), b.clone(), c.clone()])
-        );
-    }
-
-    #[test]
     fn test_lazy_format() {
-        let filter_spec = FilterSpec::match_kv("sub_log_key", "sub_log_value")
-            .or(FilterSpec::match_kv("key1", "value1"))
-            .or(FilterSpec::match_kv("key2", "value2"));
+        let filter_spec =
+            FilterSpec::any_of(&[
+                FilterSpec::match_kv("sub_log_key", "sub_log_value"),
+                FilterSpec::match_kv("key1", "value1"),
+                FilterSpec::match_kv("key2", "value2"),
+            ]);
 
         let tester = Tester::new(filter_spec, EvaluationOrder::LoggerAndMessage);
 
@@ -867,7 +858,10 @@ mod tests {
     fn test_evaluation_order() {
         fn new_tester(evaluation_order: EvaluationOrder) -> Tester {
             Tester::new(
-                FilterSpec::match_kv("key", "value").or(FilterSpec::match_kv("sub_log", "a")),
+                FilterSpec::any_of(&[
+                    FilterSpec::match_kv("key", "value"),
+                    FilterSpec::match_kv("sub_log", "a"),
+                ]),
                 evaluation_order,
             )
         }
@@ -1024,10 +1018,13 @@ mod tests {
     }
 
     #[test]
-    fn test_and() {
+    fn test_all_of() {
         {
             let tester = Tester::new(
-                FilterSpec::match_kv("key1", "value1").and(FilterSpec::match_kv("key2", "value2")),
+                FilterSpec::all_of(&[
+                    FilterSpec::match_kv("key1", "value1"),
+                    FilterSpec::match_kv("key2", "value2"),
+                ]),
                 EvaluationOrder::LoggerAndMessage,
             );
             info!(tester.log, "ACCEPT"; "key1" => "value1", "key2" => "value2");
@@ -1041,10 +1038,13 @@ mod tests {
     }
 
     #[test]
-    fn test_or() {
+    fn test_any_of() {
         {
             let tester = Tester::new(
-                FilterSpec::match_kv("key1", "value1").or(FilterSpec::match_kv("key2", "value2")),
+                FilterSpec::any_of(&[
+                    FilterSpec::match_kv("key1", "value1"),
+                    FilterSpec::match_kv("key2", "value2"),
+                ]),
                 EvaluationOrder::LoggerAndMessage,
             );
             info!(tester.log, "ACCEPT: key1"; "key1" => "value1");
@@ -1094,8 +1094,10 @@ mod tests {
         // We pass everything with level at least info, OR anything that matches the positive filter but not the negative one.
         // `And` and `Or` rules are evaluated first-to-last, so put the simplest rules (`LevelAtLeast`) first so the filter
         // doesn't have to evaluate the more complicated rules if the simpler one already decides a message's fate
-        let filter =
-            FilterSpec::LevelAtLeast(Level::Info).or(positive_filter.and(negative_filter.not()));
+        let filter = FilterSpec::any_of(&[
+            FilterSpec::LevelAtLeast(Level::Info),
+            FilterSpec::all_of(&[positive_filter, negative_filter.not()])
+        ]);
 
         let tester = Tester::new(filter, EvaluationOrder::LoggerAndMessage);
 
@@ -1130,17 +1132,28 @@ mod tests {
 
         let match_kv = FilterSpec::match_kv;
 
-        let subsystem_a = (match_kv("subsystem", "A1").or(match_kv("subsystem", "A2")))
-            .and(FilterSpec::LevelAtLeast(Level::Debug));
+        let subsystem_a =
+            FilterSpec::all_of(&[
+                FilterSpec::any_of(&[
+                    match_kv("subsystem", "A1"),
+                    match_kv("subsystem", "A2")
+                ]),
+                FilterSpec::LevelAtLeast(Level::Debug)
+            ]);
 
-        let subsystem_b = (match_kv("subsystem", "B1").or(match_kv("subsystem", "B2")))
-            .and(FilterSpec::LevelAtLeast(Level::Info));
+        let subsystem_b =
+            FilterSpec::all_of(&[
+                FilterSpec::any_of(&[match_kv("subsystem", "B1"), match_kv("subsystem", "B2")]),
+                FilterSpec::LevelAtLeast(Level::Info)
+            ]);
 
         // `And` and `Or` rules are evaluated first-to-last, so put the simplest rules (`LevelAtLeast`) first so the filter
         // doesn't have to evaluate the more complicated rules if the simpler one already decides a message's fate
-        let filter = FilterSpec::LevelAtLeast(Level::Warning)
-            .or(subsystem_a)
-            .or(subsystem_b);
+        let filter = FilterSpec::any_of(&[
+            FilterSpec::LevelAtLeast(Level::Warning),
+            subsystem_a,
+            subsystem_b
+        ]);
 
         // EvaluationOrder::Logger means that only the logger KVs will be used for message filtering
         let tester = Tester::new(filter, EvaluationOrder::LoggerOnly);
